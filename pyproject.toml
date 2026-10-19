@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-sequencecraft-pack"
+version = "0.1.0"
+description = "Sequential/random image+preset picking with dynamic prompt variable injection"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.comfy]
+DisplayName = "SequenceCraft"
+requires-comfyui = ">=0.18.0"
