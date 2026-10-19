@@ -18,6 +18,18 @@ __name__
 __dir/name__
     Wildcard in a subdirectory.
 
+__clothing/tops__
+    A list inside a YAML/JSON file, named by its key path (the file name is
+    not part of it, as in sd-dynamic-prompts).  ``__clothing__`` draws from
+    every list under ``clothing``; the same works for folders.
+
+__colors*__  /  __artists/**__
+    Globs: ``*`` matches within one level, ``**`` any depth; the values of
+    every matching wildcard are pooled.
+
+__name(season=winter)__
+    Pass variables into the wildcard's value (it may use ``${season}``).
+
 # comment
     Lines (or line portions) starting with # are treated as comments and
     stripped from the output.  Inside a variant group, options that reduce
@@ -94,7 +106,8 @@ _MAX_VARIANT_PASSES = 200
 _MAX_RESOLVE_ROUNDS = 20
 
 _VARIANT_RE  = re.compile(r"(?<!\$)\{([^{}]*)\}")
-_WILDCARD_RE = re.compile(r"__(!?)([a-zA-Z0-9_/\\.-]+)__")
+_WILDCARD_RE = re.compile(r"__(!?)([a-zA-Z0-9_/\\.*-]+)(?:\(([^()]*)\))?__")
+_WILDCARD_ARG_RE = re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*=(.*)$", re.DOTALL)
 
 # Matches the *inner* content of ${…} as a declaration.
 # Groups: name, preserve ('?' or ''), immediate ('!' or ''), value
@@ -112,57 +125,141 @@ _VAR_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
 # ---------------------------------------------------------------------------
 
 def _load_txt(text: str) -> list[str]:
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    return [line.strip() for line in _strip_line_comments(text).splitlines() if line.strip()]
 
 
-def _load_json(text: str) -> list[str]:
-    data = json.loads(text)
+def _list_values(items: list) -> list[str]:
+    """
+    Scalar entries of a YAML/JSON list as strings (nested lists/dicts are skipped).
+    ``#`` comments are dropped here, so a ``# Usage: __this__`` line in a
+    multi-line value is never expanded.
+    """
+    values = []
+    for v in items:
+        if v is None or isinstance(v, (dict, list)):
+            continue
+        text = _strip_line_comments(str(v)).strip()
+        if text:
+            values.append(text)
+    return values
+
+
+def _structured_entries(data: Any, prefix: str) -> dict[str, list[str]]:
+    """
+    Flatten a YAML/JSON hierarchy the sd-dynamic-prompts way: every list is a
+    wildcard named by its key path (``artists/finnish``); keys holding plain
+    scalars are ignored.
+    """
+    out: dict[str, list[str]] = {}
     if isinstance(data, list):
-        return [str(v) for v in data if str(v).strip()]
-    return []
+        values = _list_values(data)
+        if values and prefix:
+            out[prefix] = values
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                out.update(_structured_entries(value, f"{prefix}/{key}" if prefix else str(key)))
+    return out
 
 
-def _load_yaml(text: str) -> list[str]:
+def _load_structured(text: str, ext: str) -> Any:
+    if ext == ".json":
+        return json.loads(text)
     if not _HAS_YAML:
-        return []
-    data = _yaml.safe_load(text)
-    if isinstance(data, list):
-        return [str(v) for v in data if str(v).strip()]
-    return []
+        return None
+    return _yaml.safe_load(text)
 
 
 def load_wildcard_file(path: Path) -> list[str]:
-    """Load wildcard values from a file. Returns an empty list on any error."""
+    """Load the values of a text file, or of a structured file that is one plain list."""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+        if path.suffix.lower() == ".txt":
+            return _load_txt(text)
+        data = _load_structured(text, path.suffix.lower())
+    except Exception:  # unreadable or malformed
         return []
-    ext = path.suffix.lower()
-    if ext == ".txt":
-        return _load_txt(text)
-    if ext == ".json":
-        return _load_json(text)
-    if ext in (".yaml", ".yml"):
-        return _load_yaml(text)
-    return []
+    return _list_values(data) if isinstance(data, list) else []
 
 
 WILDCARD_EXTS = (".txt", ".yaml", ".yml", ".json")
-_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]+(?:[/\\][a-zA-Z0-9_.-]+)*$")
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.*-]+(?:[/\\][a-zA-Z0-9_.*-]+)*$")
+_INDEX_TTL = 2.0  # seconds a scan of the wildcards folder is reused
+_index_cache: dict[str, tuple[float, tuple, dict, dict]] = {}
+
+
+def _add(table: dict[str, list[str]], name: str, values: list[str]) -> None:
+    table.setdefault(name, [])
+    table[name].extend(v for v in values if v not in table[name])
+
+
+def _wildcard_index(wildcards_dir: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """
+    ``(names, aliases)`` for every wildcard under *wildcards_dir*.
+
+    - ``.txt`` (and a YAML/JSON file that is a bare list): named by its path,
+      ``dir/name``.
+    - YAML/JSON holding a mapping: each list inside is named by its folder plus
+      key path; the file name is not part of it (as in sd-dynamic-prompts), so
+      ``clothing.yaml`` → ``clothing: {tops: […]}`` is ``__clothing/tops__``.
+      The same lists are also reachable with the file name in front
+      (``dir/file/key``) as an unlisted alias.
+
+    Reloads when a file is added, removed or changed (checked at most every
+    ``_INDEX_TTL`` seconds).
+    """
+    import time
+
+    key = str(wildcards_dir)
+    now = time.monotonic()
+    cached = _index_cache.get(key)
+    if cached and now - cached[0] < _INDEX_TTL:
+        return cached[2], cached[3]
+
+    files: list[Path] = []
+    if wildcards_dir.is_dir():
+        files = sorted(
+            p for p in wildcards_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in WILDCARD_EXTS
+        )
+    signature = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in files)
+    if cached and cached[1] == signature:
+        _index_cache[key] = (now, signature, cached[2], cached[3])
+        return cached[2], cached[3]
+
+    names: dict[str, list[str]] = {}
+    aliases: dict[str, list[str]] = {}
+    for p in files:
+        rel = p.relative_to(wildcards_dir).with_suffix("").as_posix()
+        ext = p.suffix.lower()
+        try:
+            text = p.read_text(encoding="utf-8")
+            if ext == ".txt":
+                values = _load_txt(text)
+                if values:
+                    _add(names, rel, values)
+                continue
+            data = _load_structured(text, ext)
+        except Exception:
+            continue  # unreadable or malformed file: skip it, keep the rest
+        if isinstance(data, list):
+            values = _list_values(data)
+            if values:
+                _add(names, rel, values)
+        elif isinstance(data, dict):
+            folder = rel.rpartition("/")[0]
+            for name, values in _structured_entries(data, folder).items():
+                _add(names, name, values)
+            for name, values in _structured_entries(data, rel).items():
+                _add(aliases, name, values)
+
+    _index_cache[key] = (now, signature, names, aliases)
+    return names, aliases
 
 
 def list_wildcards(wildcards_dir: Path) -> list[str]:
-    """Names (``dir/name`` without extension) of all wildcard files."""
-    names: set[str] = set()
-    if wildcards_dir.is_dir():
-        for p in wildcards_dir.rglob("*"):
-            if p.is_file() and p.suffix.lower() in WILDCARD_EXTS:
-                names.add(p.relative_to(wildcards_dir).with_suffix("").as_posix())
-    return sorted(names, key=str.lower)
+    """Names of all wildcards (``dir/name``; YAML/JSON lists by key path)."""
+    return sorted(_wildcard_index(wildcards_dir)[0], key=str.lower)
 
 
 def safe_wildcard_name(name: str) -> bool:
@@ -172,23 +269,38 @@ def safe_wildcard_name(name: str) -> bool:
     return all(part not in ("", ".", "..") for part in name.replace("\\", "/").split("/"))
 
 
+def _glob_re(pattern: str) -> re.Pattern:
+    """``*`` matches within one folder level, ``**`` across levels."""
+    out = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+    return re.compile(f"^{out}$")
+
+
 def find_wildcard(name: str, wildcards_dir: Path) -> list[str]:
     """
-    Find and load values for a wildcard name.
-    ``name`` may contain '/' or '\\' as subdirectory separators.
+    Values for a wildcard name. ``name`` may use '/' or '\\' between levels and
+    may hold globs: ``colors*`` (one level) or ``artists/**`` (any depth).
+    A name that is a folder or a YAML/JSON branch (``artists``) draws from
+    every list under it.
     Returns an empty list if nothing is found (or the name would leave the folder).
     """
     if not safe_wildcard_name(name):
         return []
-    parts = name.replace("\\", "/").split("/")
-    rel = Path(*parts)
-    for ext in (".txt", ".yaml", ".yml", ".json"):
-        candidate = wildcards_dir / (str(rel) + ext)
-        if candidate.is_file():
-            values = load_wildcard_file(candidate)
-            if values:
-                return values
-    return []
+    name = name.replace("\\", "/")
+    names, aliases = _wildcard_index(wildcards_dir)
+    if "*" in name:
+        pattern = _glob_re(name)
+        matched = [k for k in names if pattern.match(k)]
+    else:
+        matched = [name] if name in names else [k for k in names if k.startswith(name + "/")]
+        if not matched and name in aliases:
+            return list(aliases[name])
+        if not matched:
+            matched = [k for k in aliases if k.startswith(name + "/")]
+            names = aliases
+    values: list[str] = []
+    for k in sorted(matched):
+        values.extend(v for v in names[k] if v not in values)
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +543,21 @@ def resolve_variants(
 # Wildcard resolution  __name__
 # ---------------------------------------------------------------------------
 
+def _wildcard_args(args: str | None) -> str:
+    """
+    ``__name(season=winter, hair=red)__`` → ``${season=!winter}${hair=!red}``,
+    put in front of the picked value so the template's ``${season}`` reads it.
+    """
+    if not args:
+        return ""
+    decls = []
+    for part in args.split(","):
+        m = _WILDCARD_ARG_RE.match(part)
+        if m:
+            decls.append("${%s=!%s}" % (m.group(1), m.group(2).strip()))
+    return "".join(decls)
+
+
 def resolve_wildcards(
     text: str, rng: random.Random, wildcards_dir: Path, global_seen: set[str] = None
 ) -> tuple[str, bool]:
@@ -455,9 +582,9 @@ def resolve_wildcards(
                     available = values
                 chosen = rng.choice(available)
                 global_seen.add(chosen)
-                return chosen
             else:
-                return rng.choice(values)
+                chosen = rng.choice(values)
+            return _wildcard_args(m.group(3)) + chosen
         return m.group(0)
 
     return _WILDCARD_RE.sub(_replace, text), replaced
