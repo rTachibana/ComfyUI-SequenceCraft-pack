@@ -38,6 +38,25 @@ ${var?=!value}
     Declare variable ``var`` only if it is NOT already set.
     Useful for providing defaults in reusable templates.
 
+${@{ name: value … | name: value … }}
+    SET: pick ONE option and declare all of its ``name: value`` lines at once
+    (same line format as the preset slot), so related parts stay together:
+        ${@{
+        bottom: pleated skirt
+        wind: skirt fluttering in the wind
+        |
+        bottom: denim shorts
+        wind: hair blowing in the wind
+        }}
+    Values are resolved immediately (like ``=!``). ``2::`` at the start of an
+    option weights it.  Options are separated by a ``|`` outside ``{…}``.
+
+${if var~text: then | else}
+    CONDITION: output ``then`` if the variable's value matches, else ``else``
+    (the ``| else`` part is optional).  Operators (case-insensitive):
+    ``~`` contains, ``!~`` does not contain, ``=`` equals, ``!=`` differs.
+    An undeclared variable counts as "".
+
 ${var}
     Read variable ``var`` (error if not declared).
 
@@ -247,7 +266,8 @@ def diagnose(text: str, wildcards_dir: Path | None = None) -> list[dict[str, Any
     Like :func:`validate_syntax`, but structured for editors:
     ``[{"code", "line", "col", "name"?}]`` sorted by position.
 
-    Codes: ``unclosed_var`` (``${`` without ``}``), ``unclosed_brace``,
+    Codes: ``unclosed_var`` (``${`` without ``}``), ``bad_set`` (``${@{…}}`` with
+    no ``name: value`` line), ``bad_if`` (``${if …}`` not in ``if name~text: …`` form), ``unclosed_brace``,
     ``unexpected_brace``, ``bad_wildcard`` (stray ``__``) and, when
     *wildcards_dir* is given, ``unknown_wildcard`` (no such file).
     Comments are stripped first; line/column still match the original text.
@@ -269,6 +289,11 @@ def diagnose(text: str, wildcards_dir: Path | None = None) -> list[dict[str, Any
                 at(i, "unclosed_var")
                 i += 2
             else:
+                inner = stripped[i + 2:end]
+                if inner.startswith("@") and (not inner.startswith("@{") or not _set_options(inner[2:-1])):
+                    at(i, "bad_set")
+                elif re.match(r"if\s", inner) and not _IF_RE.match(inner):
+                    at(i, "bad_if")
                 i = end + 1
             continue
         if stripped[i] == "{":
@@ -484,6 +509,68 @@ def _resolve_expression(
     return text
 
 
+_SET_LINE_RE = re.compile(r"^\s*(?P<name>[a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*(?P<value>.*?)\s*$")
+_IF_RE = re.compile(
+    r"^if\s+(?P<name>[a-zA-Z_][a-zA-Z0-9_-]*)\s*(?P<op>!~|~|!=|=)\s*(?P<value>[^:]*?)\s*:(?P<body>.*)$",
+    re.DOTALL,
+)
+_SET_WEIGHT_RE = re.compile(r"^\s*(?P<w>\d+(?:\.\d+)?)::")
+
+
+def _split_top(text: str, sep: str = "|") -> list[str]:
+    """Split on *sep* only outside ``{…}`` (so nested variants stay whole)."""
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(text):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif c == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def _set_options(body: str) -> list[tuple[float, list[tuple[str, str]]]]:
+    """Parse the body of ``${@{…}}`` into ``[(weight, [(name, value), …]), …]``."""
+    options = []
+    for raw in _split_top(body):
+        weight = 1.0
+        m = _SET_WEIGHT_RE.match(raw)
+        if m:
+            weight = float(m.group("w"))
+            raw = raw[m.end():]
+        pairs = []
+        for line in raw.splitlines():
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            lm = _SET_LINE_RE.match(line)
+            if lm:
+                pairs.append((lm.group("name"), lm.group("value")))
+        if pairs:
+            options.append((weight, pairs))
+    return options
+
+
+def _plain_value(name: str, rng: random.Random, wildcards_dir: Path, context: dict[str, Any]) -> str:
+    value = context.get(name, "")
+    if isinstance(value, tuple) and value[0] == "deferred":
+        value = _resolve_expression(value[1], rng, wildcards_dir, context)
+    return str(value)
+
+
+def _condition_holds(op: str, actual: str, expected: str) -> bool:
+    actual, expected = actual.lower(), expected.strip().lower()
+    if op == "~":
+        return expected in actual
+    if op == "!~":
+        return expected not in actual
+    if op == "=":
+        return actual.strip() == expected
+    return actual.strip() != expected   # "!="
+
+
 def resolve_variables(
     text: str,
     rng: random.Random,
@@ -516,6 +603,26 @@ def resolve_variables(
 
         inner = text[idx + 2 : end]
         pos = end + 1
+
+        # ${@{ a: x\n b: y | a: z\n b: w }} — pick one set, declare all its variables at once
+        if inner.startswith("@{") and inner.endswith("}"):
+            options = _set_options(inner[2:-1])
+            if options:
+                pairs = rng.choices([o[1] for o in options], weights=[o[0] for o in options], k=1)[0]
+                for name, value_tpl in pairs:
+                    context[name] = _resolve_expression(value_tpl, rng, wildcards_dir, context)
+            continue
+
+        # ${if name~text: then | else} — output depends on a variable's value
+        m = _IF_RE.match(inner)
+        if m:
+            then_else = _split_top(m.group("body"))
+            then_tpl = then_else[0]
+            else_tpl = "|".join(then_else[1:]) if len(then_else) > 1 else ""
+            actual = _plain_value(m.group("name"), rng, wildcards_dir, context)
+            chosen = then_tpl if _condition_holds(m.group("op"), actual, m.group("value")) else else_tpl
+            result.append(_resolve_expression(chosen.strip(), rng, wildcards_dir, context))
+            continue
 
         m = _VAR_DECL_INNER_RE.match(inner)
         if m:

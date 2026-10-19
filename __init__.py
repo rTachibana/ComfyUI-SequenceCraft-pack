@@ -68,5 +68,51 @@ try:
             raise web.HTTPNotFound(text="no such wildcard")
         return web.json_response({"name": name, "values": values})
 
+    # ---- Snippets: saved prompt fragments, pasted into prompts by editors ----
+    from pathlib import Path
+
+    _SNIPPETS_DIR = Path(__file__).parent / "snippets"
+
+    def _snippet_path(name):
+        if not parser.safe_wildcard_name(name):
+            raise web.HTTPBadRequest(text="invalid name")
+        return _SNIPPETS_DIR / (name.replace("\\", "/") + ".txt")
+
+    @PromptServer.instance.routes.get("/sequencecraft/snippets")
+    async def snippet_list(request):
+        names = []
+        if _SNIPPETS_DIR.is_dir():
+            names = sorted((p.relative_to(_SNIPPETS_DIR).with_suffix("").as_posix()
+                            for p in _SNIPPETS_DIR.rglob("*.txt") if p.is_file()), key=str.lower)
+        return web.json_response({"names": names})
+
+    @PromptServer.instance.routes.get("/sequencecraft/snippet")
+    async def snippet_get(request):
+        path = _snippet_path(request.rel_url.query.get("name", ""))
+        if not path.is_file():
+            raise web.HTTPNotFound(text="no such snippet")
+        return web.json_response({"text": path.read_text(encoding="utf-8")})
+
+    @PromptServer.instance.routes.post("/sequencecraft/snippet")
+    async def snippet_save(request):
+        """{name, text} saves (the previous version is kept as .txt.bak); {name, delete: true} removes."""
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text="invalid body")
+        path = _snippet_path(data.get("name", ""))
+        if data.get("delete") is True:
+            if not path.is_file():
+                raise web.HTTPNotFound(text="no such snippet")
+            path.replace(path.with_suffix(".txt.bak"))
+            return web.json_response({"ok": True})
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > _MAX_TEXT:
+            raise web.HTTPBadRequest(text="text must be 1-20000 chars")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            path.replace(path.with_suffix(".txt.bak"))
+        path.write_text(text, encoding="utf-8")
+        return web.json_response({"ok": True})
+
 except Exception as e:
     print(f"[SequenceCraft] Warning: Could not register API routes: {e}")

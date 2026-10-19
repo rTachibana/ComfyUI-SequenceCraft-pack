@@ -7,3 +7,4 @@ Thumbs.db
 # User content (prompts) stays local
 wildcards/*
 !wildcards/.gitkeep
+snippets/
