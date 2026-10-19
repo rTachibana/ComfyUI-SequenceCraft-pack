@@ -132,12 +132,35 @@ def load_wildcard_file(path: Path) -> list[str]:
     return []
 
 
+WILDCARD_EXTS = (".txt", ".yaml", ".yml", ".json")
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]+(?:[/\\][a-zA-Z0-9_.-]+)*$")
+
+
+def list_wildcards(wildcards_dir: Path) -> list[str]:
+    """Names (``dir/name`` without extension) of all wildcard files."""
+    names: set[str] = set()
+    if wildcards_dir.is_dir():
+        for p in wildcards_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in WILDCARD_EXTS:
+                names.add(p.relative_to(wildcards_dir).with_suffix("").as_posix())
+    return sorted(names, key=str.lower)
+
+
+def safe_wildcard_name(name: str) -> bool:
+    """True if *name* stays inside the wildcards folder (no ``..``, no absolute path)."""
+    if not isinstance(name, str) or not _SAFE_NAME_RE.match(name):
+        return False
+    return all(part not in ("", ".", "..") for part in name.replace("\\", "/").split("/"))
+
+
 def find_wildcard(name: str, wildcards_dir: Path) -> list[str]:
     """
     Find and load values for a wildcard name.
     ``name`` may contain '/' or '\\' as subdirectory separators.
-    Returns an empty list if nothing is found.
+    Returns an empty list if nothing is found (or the name would leave the folder).
     """
+    if not safe_wildcard_name(name):
+        return []
     parts = name.replace("\\", "/").split("/")
     rel = Path(*parts)
     for ext in (".txt", ".yaml", ".yml", ".json"):
@@ -217,6 +240,58 @@ def validate_syntax(text: str) -> list[str]:
     """
     stripped = _strip_line_comments(text)
     return _check_braces(stripped) + _check_wildcards(stripped)
+
+
+def diagnose(text: str, wildcards_dir: Path | None = None) -> list[dict[str, Any]]:
+    """
+    Like :func:`validate_syntax`, but structured for editors:
+    ``[{"code", "line", "col", "name"?}]`` sorted by position.
+
+    Codes: ``unclosed_var`` (``${`` without ``}``), ``unclosed_brace``,
+    ``unexpected_brace``, ``bad_wildcard`` (stray ``__``) and, when
+    *wildcards_dir* is given, ``unknown_wildcard`` (no such file).
+    Comments are stripped first; line/column still match the original text.
+    """
+    stripped = _strip_line_comments(text)
+    found: list[tuple[int, dict[str, Any]]] = []
+
+    def at(pos: int, code: str, **extra: Any) -> None:
+        line = stripped[:pos].count("\n") + 1
+        col = pos - stripped[:pos].rfind("\n")
+        found.append((pos, {"code": code, "line": line, "col": col, **extra}))
+
+    stack: list[int] = []
+    i = 0
+    while i < len(stripped):
+        if stripped[i] == "$" and i + 1 < len(stripped) and stripped[i + 1] == "{":
+            end = _find_variable_end(stripped, i)
+            if end == -1:
+                at(i, "unclosed_var")
+                i += 2
+            else:
+                i = end + 1
+            continue
+        if stripped[i] == "{":
+            stack.append(i)
+        elif stripped[i] == "}":
+            if stack:
+                stack.pop()
+            else:
+                at(i, "unexpected_brace")
+        i += 1
+    for pos in stack:
+        at(pos, "unclosed_brace")
+
+    valid: set[int] = set()
+    for m in _WILDCARD_RE.finditer(stripped):
+        valid.update((m.start(), m.end() - 2))
+        if wildcards_dir is not None and not find_wildcard(m.group(2), wildcards_dir):
+            at(m.start(), "unknown_wildcard", name=m.group(2))
+    for m in re.finditer(r"__", stripped):
+        if m.start() not in valid:
+            at(m.start(), "bad_wildcard")
+
+    return [d for _, d in sorted(found, key=lambda x: x[0])]
 
 
 # ---------------------------------------------------------------------------
