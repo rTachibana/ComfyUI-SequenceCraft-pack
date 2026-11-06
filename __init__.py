@@ -68,6 +68,56 @@ try:
             raise web.HTTPNotFound(text="no such wildcard")
         return web.json_response({"name": name, "values": values})
 
+    # ---- Wildcard files: edited a whole file at a time (see wildcard_store) ----
+    from . import wildcard_store as _ws
+
+    def _store_call(fn, *args):
+        try:
+            return web.json_response(fn(_WILDCARDS_DIR, *args))
+        except _ws.Conflict as e:
+            return web.json_response({"error": str(e), "current": e.current}, status=409)
+        except _ws.NotFound as e:
+            return web.json_response({"error": str(e)}, status=404)
+        except _ws.StoreError as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def _store_body(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text="invalid body")
+        return data
+
+    @PromptServer.instance.routes.get("/sequencecraft/wildcard-files")
+    async def wildcard_files(request):
+        """[{path, size, version, entries: [{name, count}], error?}] for every wildcard file."""
+        return web.json_response({"files": _ws.list_files(_WILDCARDS_DIR)})
+
+    @PromptServer.instance.routes.get("/sequencecraft/wildcard-file")
+    async def wildcard_file_read(request):
+        """?path=clothing.yaml → {path, text, version, entries, error?}"""
+        return _store_call(_ws.read_file, request.rel_url.query.get("path", ""))
+
+    @PromptServer.instance.routes.post("/sequencecraft/wildcard-file")
+    async def wildcard_file_save(request):
+        """{path, text} creates; {path, text, base: <version>} overwrites. 409 when base is stale."""
+        d = await _store_body(request)
+        return _store_call(_ws.save_file, d.get("path"), d.get("text"), d.get("base"))
+
+    @PromptServer.instance.routes.post("/sequencecraft/wildcard-file/rename")
+    async def wildcard_file_rename(request):
+        """{path, to, base}"""
+        d = await _store_body(request)
+        return _store_call(_ws.rename_file, d.get("path"), d.get("to"), d.get("base"))
+
+    @PromptServer.instance.routes.post("/sequencecraft/wildcard-file/delete")
+    async def wildcard_file_delete(request):
+        """{path, base} — the file is kept as <path>.bak"""
+        d = await _store_body(request)
+        return _store_call(_ws.delete_file, d.get("path"), d.get("base"))
+
     # ---- Snippets: saved prompt fragments, pasted into prompts by editors ----
     from pathlib import Path
 

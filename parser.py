@@ -281,22 +281,25 @@ def find_wildcard(name: str, wildcards_dir: Path) -> list[str]:
     may hold globs: ``colors*`` (one level) or ``artists/**`` (any depth).
     A name that is a folder or a YAML/JSON branch (``artists``) draws from
     every list under it.
+    Case is ignored (``__Hair-Color__`` finds ``hair-color.txt``); names that
+    differ only in case are drawn from together.
     Returns an empty list if nothing is found (or the name would leave the folder).
     """
     if not safe_wildcard_name(name):
         return []
-    name = name.replace("\\", "/")
+    key = name.replace("\\", "/").lower()
     names, aliases = _wildcard_index(wildcards_dir)
-    if "*" in name:
-        pattern = _glob_re(name)
-        matched = [k for k in names if pattern.match(k)]
+    if "*" in key:
+        pattern = _glob_re(key)
+        matched = [k for k in names if pattern.match(k.lower())]
     else:
-        matched = [name] if name in names else [k for k in names if k.startswith(name + "/")]
-        if not matched and name in aliases:
-            return list(aliases[name])
+        def lookup(table):
+            return [k for k in table if k.lower() == key] \
+                or [k for k in table if k.lower().startswith(key + "/")]
+        matched = lookup(names)
         if not matched:
-            matched = [k for k in aliases if k.startswith(name + "/")]
             names = aliases
+            matched = lookup(aliases)
     values: list[str] = []
     for k in sorted(matched):
         values.extend(v for v in names[k] if v not in values)
